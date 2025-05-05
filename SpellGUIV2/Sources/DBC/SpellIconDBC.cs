@@ -25,6 +25,7 @@ namespace SpellEditor.Sources.DBC
         private Thickness? iconMargin = null;
 
         public List<Icon_DBC_Lookup> Lookups = new List<Icon_DBC_Lookup>();
+        private Dictionary<uint, Icon_DBC_Lookup> LookupById = new Dictionary<uint, Icon_DBC_Lookup>();
 
         public SpellIconDBC(MainWindow window, IDatabaseAdapter adapter)
         {
@@ -41,19 +42,15 @@ namespace SpellEditor.Sources.DBC
                 uint offset = (uint)record["Name"];
                 if (offset == 0)
                     continue;
+
                 string name = LookupStringOffset(offset);
                 uint id = (uint)record["ID"];
 
-                Icon_DBC_Lookup lookup;
-                lookup.ID = id;
-                lookup.Offset = offset;
-                lookup.Name = name;
+                Icon_DBC_Lookup lookup = new Icon_DBC_Lookup { ID = id, Offset = offset, Name = name };
                 Lookups.Add(lookup);
+                LookupById[id] = lookup;
             }
 
-            // In this DBC we don't actually need to keep the DBC data now that
-            // we have extracted the lookup tables. Nulling it out may help with
-            // memory consumption.
             CleanStringsMap();
             CleanBody();
         }
@@ -81,23 +78,19 @@ namespace SpellEditor.Sources.DBC
 
         public void UpdateMainWindowIcons(double margin)
         {
-            // adapter.query below caused unhandled exception with main.selectedID as 0.
             if (adapter == null || main.selectedID == 0)
                 return;
-            
-            // Convert to background worker here
 
-            var container = adapter.Query(string.Format("SELECT `SpellIconID`,`ActiveIconID` FROM `{0}` WHERE `ID` = '{1}'", "spell", main.selectedID));
+            var container = adapter.Query($"SELECT `SpellIconID`,`ActiveIconID` FROM `spell` WHERE `ID` = '{main.selectedID}'");
             if (container == null || container.Rows.Count == 0)
-            {
                 return;
-            }
+
             var res = container.Rows[0];
             uint iconInt = uint.Parse(res[0].ToString());
             uint iconActiveInt = uint.Parse(res[1].ToString());
-            // Update currently selected icon, we don't currently handle ActiveIconID
+
             main.CurrentIcon.Source = BlpManager.GetInstance().GetImageSourceFromBlpPath(GetIconPath(iconInt) + ".blp");
-            // Load all icons available if we have not already
+
             if (main.IconGrid.Children.Count == 0)
             {
                 var watch = new Stopwatch();
@@ -119,28 +112,32 @@ namespace SpellEditor.Sources.DBC
                     pathsToAdd.Add(entry);
                 }
             }
+
             var imagesPool = new List<Image>(pathsToAdd.Count);
             for (int i = 0; i < pathsToAdd.Count; ++i)
             {
                 imagesPool.Add(new Image());
             }
+
             for (int i = 0; i < pathsToAdd.Count; ++i)
             {
                 var entry = pathsToAdd[i];
                 var image = imagesPool[i];
-                image.Width = iconSize == null ? 32 : iconSize.Value;
-                image.Height = iconSize == null ? 32 : iconSize.Value;
-                image.Margin = iconMargin == null ? new Thickness(margin, 0, 0, 0) : iconMargin.Value;
+                image.Width = iconSize ?? 32;
+                image.Height = iconSize ?? 32;
+                image.Margin = iconMargin ?? new Thickness(margin, 0, 0, 0);
                 image.VerticalAlignment = VerticalAlignment.Top;
                 image.HorizontalAlignment = HorizontalAlignment.Left;
                 image.Name = "Index_" + entry.Offset;
                 image.ToolTip = entry.ID + " - " + entry.Name + ".blp";
                 image.MouseDown += ImageDown;
             }
+
             foreach (var image in imagesPool)
             {
                 main.IconGrid.Children.Add(image);
             }
+
             if (Config.Config.RenderImagesInView)
             {
                 main.IconScrollViewer.ScrollChanged += IconScrollViewer_ScrollChanged;
@@ -171,7 +168,9 @@ namespace SpellEditor.Sources.DBC
                         if (source == null)
                         {
                             var path = image.ToolTip.ToString().Substring(image.ToolTip.ToString().IndexOf('-') + 2);
-                            await Task.Factory.StartNew(() => source = BlpManager.GetInstance().GetImageSourceFromBlpPath(path));
+                            await Task.Factory.StartNew(() =>
+                                source = BlpManager.GetInstance().GetImageSourceFromBlpPath(path)
+                            );
                         }
                     }
                     else
@@ -186,13 +185,10 @@ namespace SpellEditor.Sources.DBC
         private async void IsImageVisibleChanged(object sender, DependencyPropertyChangedEventArgs e)
         {
             var image = sender as Image;
-            var source = image.Source;
-            if (source == null && (bool)e.NewValue)
+            if (image.Source == null && (bool)e.NewValue)
             {
                 var path = image.ToolTip.ToString().Substring(image.ToolTip.ToString().IndexOf('-') + 2);
-                await Task.Factory.StartNew(() => 
-                    source = BlpManager.GetInstance().GetImageSourceFromBlpPath(path)
-                );
+                var source = await Task.Run(() => BlpManager.GetInstance().GetImageSourceFromBlpPath(path));
                 image.Source = source;
             }
         }
@@ -202,51 +198,35 @@ namespace SpellEditor.Sources.DBC
             var image = sender as Image;
             main.NewIcon.Source = image.Source;
 
-            uint offset = uint.Parse(image.Name.Substring(6));
-            uint ID = 0;
-            for (int i = 0; i < Header.RecordCount; ++i)
+            if (!uint.TryParse(image.Name.Substring(6), out uint offset))
+                return;
+
+            foreach (var record in Lookups)
             {
-                if (Lookups[i].Offset == offset)
+                if (record.Offset == offset)
                 {
-                    ID = Lookups[i].ID;
+                    main.newIconID = record.ID;
                     break;
                 }
             }
-            main.newIconID = ID;
         }
 
         public string GetIconPath(uint iconId)
         {
-            Icon_DBC_Lookup selectedRecord;
-            selectedRecord.ID = int.MaxValue;
-            selectedRecord.Name = "";
-            for (int i = 0; i < Header.RecordCount; ++i)
+            if (!LookupById.TryGetValue(iconId, out Icon_DBC_Lookup record))
             {
-                if (Lookups[i].ID == iconId)
-                {
-                    selectedRecord = Lookups[i];
-                    break;
-                }
-            }      
-            try
-            {
-                if (selectedRecord.ID == int.MaxValue) {
-                    // Raising the exception is causing lag when a lot of spells do not exist, so just load nothing
-                    return "";
-                    //throw new Exception("The icon trying to be loaded does not exist in the SpellIcon.dbc");
-                }
-                string icon = selectedRecord.Name;
-                if (!File.Exists(icon + ".blp"))
-                {
-                    throw new Exception("File could not be found: " + "Icons\\" + icon + ".blp");
-                }
+                Logger.Info($"Icon ID {iconId} not found in SpellIcon.dbc Lookups.");
+                return ""; // fallback
             }
-            catch (Exception ex)
+
+            string icon = record.Name;
+            if (!File.Exists(icon + ".blp"))
             {
-                Logger.Info(ex.Message);
-                Logger.Info(ex.StackTrace);
+                Logger.Info($"File could not be found: Icons\\{icon}.blp");
+                return "";
             }
-            return selectedRecord.Name;
+
+            return icon;
         }
 
         public struct Icon_DBC_Lookup
